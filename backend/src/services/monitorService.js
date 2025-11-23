@@ -1,6 +1,9 @@
 const axios = require('axios');
+const https = require('https');
+const tls = require('tls');
 const db = require('../config/database');
 const { performance } = require('perf_hooks');
+const notificationService = require('./notificationService');
 
 // Store active monitoring intervals
 const activeMonitors = new Map();
@@ -42,8 +45,30 @@ const performCheck = async (monitor) => {
     };
 
     // Check SSL certificate if HTTPS
-    if (monitor.url.startsWith('https://')) {
-      checkResult.ssl_valid = true; // Simplified - in production, check actual cert
+    if (monitor.url.startsWith('https://') && monitor.ssl_check_enabled !== false) {
+      const sslInfo = await checkSSL(monitor.url);
+      checkResult.ssl_valid = sslInfo.valid;
+      checkResult.ssl_expires_at = sslInfo.expiresAt;
+
+      // Check SSL expiry threshold
+      if (sslInfo.daysUntilExpiry !== null && sslInfo.daysUntilExpiry <= (monitor.ssl_expiry_threshold || 30)) {
+        await notificationService.sendNotification(monitor.organization_id, 'ssl_expiring', {
+          monitorId: monitor.id,
+          monitorName: monitor.name,
+          monitorUrl: monitor.url,
+          daysUntilExpiry: sslInfo.daysUntilExpiry,
+          expiryDate: sslInfo.expiresAt
+        });
+      }
+    }
+
+    // Validate response assertions
+    if (monitor.assertions && monitor.assertions.length > 0) {
+      const assertionResults = validateAssertions(response.data, monitor.assertions);
+      if (!assertionResults.passed) {
+        checkResult.is_up = false;
+        checkResult.error = `Assertion failed: ${assertionResults.failedAssertion}`;
+      }
     }
   } catch (error) {
     const totalTime = performance.now() - startTime;
@@ -120,11 +145,12 @@ const checkForIncident = async (monitor, checkResult) => {
 
       if (openIncidents.length === 0) {
         // Create new incident
-        await db.query(
+        const { rows: [incident] } = await db.query(
           `INSERT INTO incidents (
             monitor_id, organization_id, title, description, severity, status
           )
-          VALUES ($1, $2, $3, $4, $5, $6)`,
+          VALUES ($1, $2, $3, $4, $5, $6)
+          RETURNING id`,
           [
             monitor.id,
             monitor.organization_id,
@@ -134,6 +160,16 @@ const checkForIncident = async (monitor, checkResult) => {
             'open'
           ]
         );
+
+        // Send notifications
+        await notificationService.sendNotification(monitor.organization_id, 'incident_created', {
+          incidentId: incident.id,
+          monitorId: monitor.id,
+          monitorName: monitor.name,
+          monitorUrl: monitor.url,
+          error: checkResult.error,
+          severity: 'high'
+        });
 
         // Emit incident created event
         global.io?.to(`org-${monitor.organization_id}`).emit('incident:created', {
@@ -312,11 +348,137 @@ const calculateDailyStats = async () => {
   }
 };
 
+/**
+ * Check SSL certificate validity and expiry
+ */
+const checkSSL = async (url) => {
+  return new Promise((resolve) => {
+    try {
+      const urlObj = new URL(url);
+      const options = {
+        host: urlObj.hostname,
+        port: urlObj.port || 443,
+        method: 'GET',
+        rejectUnauthorized: false // We want to check even invalid certs
+      };
+
+      const req = https.request(options, (res) => {
+        const cert = res.socket.getPeerCertificate();
+
+        if (!cert || Object.keys(cert).length === 0) {
+          return resolve({ valid: false, expiresAt: null, daysUntilExpiry: null });
+        }
+
+        const expiryDate = new Date(cert.valid_to);
+        const now = new Date();
+        const daysUntilExpiry = Math.floor((expiryDate - now) / (1000 * 60 * 60 * 24));
+
+        resolve({
+          valid: now < expiryDate,
+          expiresAt: cert.valid_to,
+          daysUntilExpiry,
+          issuer: cert.issuer,
+          subject: cert.subject
+        });
+      });
+
+      req.on('error', () => {
+        resolve({ valid: false, expiresAt: null, daysUntilExpiry: null });
+      });
+
+      req.end();
+    } catch (error) {
+      resolve({ valid: false, expiresAt: null, daysUntilExpiry: null });
+    }
+  });
+};
+
+/**
+ * Validate response assertions
+ */
+const validateAssertions = (responseData, assertions) => {
+  for (const assertion of assertions) {
+    const { type, property, operator, value } = assertion;
+
+    let actualValue;
+
+    // Extract value from response
+    if (property) {
+      const keys = property.split('.');
+      actualValue = keys.reduce((obj, key) => obj?.[key], responseData);
+    } else {
+      actualValue = responseData;
+    }
+
+    // Perform comparison based on operator
+    let passed = false;
+
+    switch (operator) {
+      case 'equals':
+        passed = actualValue == value;
+        break;
+      case 'not_equals':
+        passed = actualValue != value;
+        break;
+      case 'contains':
+        passed = String(actualValue).includes(value);
+        break;
+      case 'not_contains':
+        passed = !String(actualValue).includes(value);
+        break;
+      case 'greater_than':
+        passed = Number(actualValue) > Number(value);
+        break;
+      case 'less_than':
+        passed = Number(actualValue) < Number(value);
+        break;
+      case 'exists':
+        passed = actualValue !== undefined && actualValue !== null;
+        break;
+      case 'not_exists':
+        passed = actualValue === undefined || actualValue === null;
+        break;
+      default:
+        passed = true;
+    }
+
+    if (!passed) {
+      return {
+        passed: false,
+        failedAssertion: `${property || 'response'} ${operator} ${value} (got: ${JSON.stringify(actualValue)})`
+      };
+    }
+  }
+
+  return { passed: true };
+};
+
+/**
+ * Check if monitor is in maintenance window
+ */
+const isInMaintenanceWindow = async (monitorId, organizationId) => {
+  const now = new Date();
+
+  const { rows } = await db.query(
+    `SELECT id FROM maintenance_windows
+     WHERE organization_id = $1
+       AND (monitor_ids = ARRAY[]::UUID[] OR $2 = ANY(monitor_ids))
+       AND start_time <= $3
+       AND end_time >= $3`,
+    [organizationId, monitorId, now]
+  );
+
+  return rows.length > 0;
+};
+
 module.exports = {
   startMonitoring,
   stopMonitoring,
   restartMonitoring,
   initializeAllMonitors,
   performCheck,
-  calculateDailyStats
+  calculateDailyStats,
+  checkSSL,
+  validateAssertions,
+  isInMaintenanceWindow
 };

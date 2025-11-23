@@ -7,6 +7,9 @@ require('dotenv').config();
 const authRoutes = require('./routes/auth');
 const monitorRoutes = require('./routes/monitors');
 const incidentRoutes = require('./routes/incidents');
+const notificationRoutes = require('./routes/notifications');
+const teamRoutes = require('./routes/team');
+const statusPageRoutes = require('./routes/statusPages');
 
 const app = express();
 
@@ -45,6 +48,10 @@ app.get('/health', (req, res) => {
 app.use('/api/auth', authRoutes);
 app.use('/api/organizations/:orgId/monitors', monitorRoutes);
 app.use('/api/organizations/:orgId/incidents', incidentRoutes);
+app.use('/api/organizations/:orgId/notifications', notificationRoutes);
+app.use('/api/organizations/:orgId/team', teamRoutes);
+app.use('/api/organizations/:orgId/status-pages', statusPageRoutes);
+app.use('/api/status', statusPageRoutes); // Public status page endpoint
 
 // Dashboard stats endpoint
 app.get('/api/organizations/:orgId/dashboard', async (req, res) => {
